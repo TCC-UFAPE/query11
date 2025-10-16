@@ -7,7 +7,7 @@ import json
 
 BASE_URL = "https://vulnerabilityhistory.org/api"
 GITHUB_API_BASE = "https://api.github.com"
-GITHUB_TOKEN = ""
+GITHUB_TOKEN = "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"
 
 def get_github_headers():
     headers = {
