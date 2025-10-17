@@ -3,9 +3,9 @@ import pandas as pd
 import re
 import requests
 import time
-from pathlib import Path
+import base64
 
-GITHUB_TOKEN = "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"
+GITHUB_TOKEN = ""
 GITHUB_API_BASE = "https://api.github.com"
 BASE_URL = "https://vulnerabilityhistory.org/api"
 
@@ -22,22 +22,13 @@ def get_github_headers():
 
 
 def sanitize_folder_name(cve_name):
-    """
-    Sanitiza o nome do CVE para criar um nome de pasta válido
-    Remove caracteres não permitidos em nomes de pastas do Windows
-    """
-    # Remove caracteres não permitidos: \ / : * ? " < > |
+    """Sanitiza o nome do CVE para criar um nome de pasta válido"""
     sanitized = re.sub(r'[\\/:*?"<>|]', '_', cve_name)
-    # Remove espaços extras e limita o tamanho
-    sanitized = sanitized.strip()
-    return sanitized
+    return sanitized.strip()
 
 
 def sanitize_file_path(file_path):
-    """
-    Sanitiza o caminho do arquivo para criar uma estrutura válida no Windows
-    """
-    # Substitui caracteres inválidos
+    """Sanitiza o caminho do arquivo para criar uma estrutura válida no Windows"""
     sanitized = file_path.replace(':', '_').replace('*', '_').replace('?', '_')
     sanitized = sanitized.replace('"', '_').replace('<', '_').replace('>', '_')
     sanitized = sanitized.replace('|', '_')
@@ -45,364 +36,284 @@ def sanitize_file_path(file_path):
 
 
 def get_commit_hashes_from_vulnerability(cve, session):
-    """Extrai hashes de commits de uma vulnerabilidade específica através dos eventos"""
+    """Extrai hashes de commits de uma vulnerabilidade específica"""
     try:
         events_response = session.get(f"{BASE_URL}/vulnerabilities/{cve}/events", timeout=30)
         events_response.raise_for_status()
         events = events_response.json()
         
         commit_hashes = []
+        seen_hashes = set()  # Para evitar duplicação
+        
         for event in events:
             event_type = event.get('event_type', '')
             if event_type in ['fix', 'vcc']:
                 description = event.get('description', '')
                 commit_match = re.search(r'/commits/([a-f0-9]{40})', description)
                 if commit_match:
-                    commit_hashes.append(commit_match.group(1))
+                    commit_hash = commit_match.group(1)
+                    if commit_hash not in seen_hashes:
+                        commit_hashes.append(commit_hash)
+                        seen_hashes.add(commit_hash)
         
         return commit_hashes
-    except requests.exceptions.RequestException:
+    except:
         return []
 
 
-def get_github_commit_data(repo_full_name, commit_hash, session):
-    """Busca dados completos do commit no GitHub via API REST"""
-    try:
-        headers = get_github_headers()
-        url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/commits/{commit_hash}"
-        response = session.get(url, headers=headers, timeout=30)
-
-        if response.status_code in [401, 403, 404, 422]:
-            return None
-
-        response.raise_for_status()
-        data = response.json()
-
-        if 'commit' not in data:
-            return None
-
-        return data
-
-    except:
-        return None
-
-
-def download_file_from_github(repo_full_name, commit_hash, file_path, session):
+def download_file_content_after_commit(repo_full_name, commit_hash, file_path, session):
     """
-    Baixa o conteúdo de um arquivo específico de um commit do GitHub
-    
-    Args:
-        repo_full_name: Nome completo do repositório (owner/repo)
-        commit_hash: Hash do commit
-        file_path: Caminho do arquivo no repositório
-        session: Sessão de requests
-        
-    Returns:
-        Conteúdo do arquivo ou None se houver erro
+    Baixa o conteúdo COMPLETO de um arquivo APÓS o commit (versão modificada)
+    Retorna o conteúdo do arquivo sem sinais de diff
     """
     try:
         headers = get_github_headers()
-        # URL para buscar o arquivo em um commit específico
+        # Buscar o arquivo no estado após o commit
         url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{file_path}?ref={commit_hash}"
         response = session.get(url, headers=headers, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
-            # O conteúdo vem em base64
-            import base64
-            if 'content' in data:
+            if 'content' in data and data.get('encoding') == 'base64':
+                # Decodificar o conteúdo base64
                 content = base64.b64decode(data['content']).decode('utf-8', errors='ignore')
-                return content
+                return content, data.get('size', 0)
         
-        return None
-    except:
-        return None
+        return None, 0
+    except Exception as e:
+        return None, 0
 
 
-def create_commit_files(cve_folder, repo_full_name, commit_hashes, session):
+def process_commit_files(repo_full_name, commit_hash, commit_folder, session):
     """
-    Cria arquivos modificados de cada commit dentro da pasta do CVE
+    Processa e baixa arquivos de um commit específico
+    Baixa a versão COMPLETA dos arquivos após o commit (SEM + e -)
     
     Args:
-        cve_folder: Caminho da pasta do CVE
-        repo_full_name: Nome completo do repositório GitHub
-        commit_hashes: Lista de hashes dos commits
+        repo_full_name: Nome do repositório (owner/repo)
+        commit_hash: Hash do commit
+        commit_folder: Pasta onde salvar os arquivos
         session: Sessão de requests
+    
+    Returns:
+        Número de arquivos baixados
     """
-    if not repo_full_name or repo_full_name == 'N/A':
-        return 0, 0
-    
-    total_files_created = 0
-    total_commits_processed = 0
-    
-    for commit_idx, commit_hash in enumerate(commit_hashes, 1):
-        print(f"      → Processando commit {commit_idx}/{len(commit_hashes)}: {commit_hash[:8]}...")
+    try:
+        headers = get_github_headers()
+        url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/commits/{commit_hash}"
+        response = session.get(url, headers=headers, timeout=30)
         
-        # Buscar dados do commit
-        commit_data = get_github_commit_data(repo_full_name, commit_hash, session)
-        if not commit_data:
-            print(f"        ✗ Não foi possível obter dados do commit")
-            continue
+        if response.status_code != 200:
+            return 0
         
-        total_commits_processed += 1
-        
-        # Criar pasta para o commit
-        commit_folder = os.path.join(cve_folder, f"commit_{commit_hash[:8]}")
-        os.makedirs(commit_folder, exist_ok=True)
-        
-        # Obter lista de arquivos modificados
+        commit_data = response.json()
         files = commit_data.get('files', [])
+        
         if not files:
-            print(f"        - Nenhum arquivo modificado")
-            continue
+            return 0
         
-        print(f"        - {len(files)} arquivo(s) modificado(s)")
+        files_downloaded = 0
         
-        # Criar um arquivo com informações do commit
-        commit_info_path = os.path.join(commit_folder, "_commit_info.txt")
-        with open(commit_info_path, 'w', encoding='utf-8') as f:
-            commit_obj = commit_data.get('commit', {})
-            f.write(f"Commit: {commit_hash}\n")
-            f.write(f"URL: {commit_data.get('html_url', 'N/A')}\n")
-            f.write(f"Autor: {commit_obj.get('author', {}).get('name', 'N/A')}\n")
-            f.write(f"Data: {commit_obj.get('author', {}).get('date', 'N/A')}\n")
-            f.write(f"Mensagem: {commit_obj.get('message', 'N/A')}\n")
-            f.write(f"\nEstatísticas:\n")
-            stats = commit_data.get('stats', {})
-            f.write(f"  - Adições: {stats.get('additions', 0)}\n")
-            f.write(f"  - Deleções: {stats.get('deletions', 0)}\n")
-            f.write(f"  - Total: {stats.get('total', 0)}\n")
-            f.write(f"\nArquivos modificados:\n")
-            for file_info in files:
-                f.write(f"  - {file_info.get('filename', 'N/A')} ({file_info.get('status', 'N/A')})\n")
-        
-        # Baixar cada arquivo modificado
+        # Processar cada arquivo
         for file_info in files:
-            file_path = file_info.get('filename', '')
-            if not file_path:
+            filename = file_info.get('filename', '')
+            if not filename:
                 continue
             
-            # Criar estrutura de pastas para o arquivo
-            sanitized_path = sanitize_file_path(file_path)
-            full_file_path = os.path.join(commit_folder, sanitized_path)
+            status = file_info.get('status', 'modified')
             
-            # Criar diretórios necessários
-            os.makedirs(os.path.dirname(full_file_path), exist_ok=True)
+            # Criar estrutura de diretórios
+            sanitized_path = sanitize_file_path(filename)
+            file_full_path = os.path.join(commit_folder, sanitized_path)
+            os.makedirs(os.path.dirname(file_full_path), exist_ok=True)
             
-            # Baixar conteúdo do arquivo
-            file_content = download_file_from_github(repo_full_name, commit_hash, file_path, session)
+            # Se o arquivo foi deletado
+            if status == 'removed':
+                with open(file_full_path + '.DELETED', 'w', encoding='utf-8') as f:
+                    f.write(f"Este arquivo foi DELETADO no commit {commit_hash[:8]}\n\n")
+                    f.write(f"Arquivo: {filename}\n")
+                    f.write(f"Commit: {commit_hash}\n")
+                files_downloaded += 1
+                print(f"         🗑 {filename} (deletado)")
+                continue
+            
+            # Baixar o conteúdo COMPLETO do arquivo após o commit
+            file_content, file_size = download_file_content_after_commit(
+                repo_full_name, commit_hash, filename, session
+            )
             
             if file_content:
-                with open(full_file_path, 'w', encoding='utf-8', errors='ignore') as f:
+                # Salvar o arquivo completo (SEM sinais de diff)
+                with open(file_full_path, 'w', encoding='utf-8', errors='ignore') as f:
                     f.write(file_content)
-                total_files_created += 1
-            
-            # Salvar o diff/patch do arquivo
-            patch = file_info.get('patch', '')
-            if patch:
-                patch_file_path = full_file_path + ".patch"
-                with open(patch_file_path, 'w', encoding='utf-8', errors='ignore') as f:
-                    f.write(f"Arquivo: {file_path}\n")
-                    f.write(f"Status: {file_info.get('status', 'N/A')}\n")
-                    f.write(f"Adições: {file_info.get('additions', 0)}\n")
-                    f.write(f"Deleções: {file_info.get('deletions', 0)}\n")
-                    f.write(f"Mudanças: {file_info.get('changes', 0)}\n")
-                    f.write(f"\n{'='*60}\n")
-                    f.write(f"DIFF:\n")
-                    f.write(f"{'='*60}\n\n")
-                    f.write(patch)
-            
-            # Pequena pausa para não sobrecarregar a API
-            time.sleep(0.1)
-        
-        # Pausa entre commits
-        time.sleep(0.3)
-    
-    return total_commits_processed, total_files_created
-
-
-def create_cve_folders_from_excel(excel_file="5_analise_completa_tokens.xlsx", base_folder="CVEs", download_files=True):
-    """
-    Lê o arquivo Excel e cria uma pasta para cada CVE encontrado
-    Também baixa os arquivos modificados de cada commit relacionado
-    
-    Args:
-        excel_file: Nome do arquivo Excel a ser analisado
-        base_folder: Nome da pasta base onde as pastas dos CVEs serão criadas
-        download_files: Se True, baixa os arquivos modificados dos commits
-    """
-    
-    # Verificar se o arquivo Excel existe
-    if not os.path.exists(excel_file):
-        print(f"[ERRO] Arquivo '{excel_file}' não encontrado!")
-        print(f"   Certifique-se de que o arquivo está no diretório atual: {os.getcwd()}")
-        return
-    
-    print(f"\n=== Analisando arquivo: {excel_file} ===\n")
-    
-    try:
-        # Ler o arquivo Excel
-        df = pd.read_excel(excel_file)
-        print(f"-> Arquivo carregado com sucesso!")
-        print(f"-> Total de linhas: {len(df)}")
-        print(f"-> Colunas disponíveis: {list(df.columns)}\n")
-        
-        # Verificar se a coluna CVE existe
-        if 'CVE' not in df.columns:
-            print("[ERRO] Coluna 'CVE' não encontrada no arquivo!")
-            print(f"   Colunas disponíveis: {list(df.columns)}")
-            return
-        
-        # Criar pasta base se não existir
-        if not os.path.exists(base_folder):
-            os.makedirs(base_folder)
-            print(f"-> Pasta base '{base_folder}' criada.\n")
-        else:
-            print(f"-> Pasta base '{base_folder}' já existe.\n")
-        
-        # Obter lista de CVEs únicos
-        cves = df['CVE'].dropna().unique()
-        print(f"-> {len(cves)} CVEs únicos encontrados.\n")
-        
-        if download_files:
-            print("-> Download de arquivos modificados: ATIVADO\n")
-        else:
-            print("-> Download de arquivos modificados: DESATIVADO\n")
-        
-        print("=== Criando pastas para cada CVE ===\n")
-        
-        # Criar sessão HTTP
-        session = requests.Session()
-        
-        created_folders = 0
-        existing_folders = 0
-        errors = []
-        total_commits = 0
-        total_files = 0
-        
-        # Criar uma pasta para cada CVE
-        for idx, cve in enumerate(cves, 1):
-            try:
-                # Sanitizar o nome do CVE
-                folder_name = sanitize_folder_name(str(cve))
-                folder_path = os.path.join(base_folder, folder_name)
                 
-                # Criar a pasta se não existir
-                if not os.path.exists(folder_path):
-                    os.makedirs(folder_path)
-                    created_folders += 1
-                    print(f"   [{idx}/{len(cves)}] ✓ Criada: {folder_name}")
-                else:
-                    existing_folders += 1
-                    print(f"   [{idx}/{len(cves)}] - Já existe: {folder_name}")
-                    
-                # Criar um arquivo README dentro da pasta com informações do CVE
-                create_readme_for_cve(df, cve, folder_path)
-                
-                # Baixar arquivos modificados dos commits, se solicitado
-                if download_files:
-                    # Buscar repositório do CVE
-                    cve_data = df[df['CVE'] == cve].iloc[0]
-                    repo_full_name = cve_data.get('Repositório GitHub', 'N/A')
-                    
-                    if repo_full_name and repo_full_name != 'N/A':
-                        print(f"      Buscando commits do repositório: {repo_full_name}")
-                        
-                        # Buscar commits relacionados ao CVE
-                        commit_hashes = get_commit_hashes_from_vulnerability(cve, session)
-                        
-                        if commit_hashes:
-                            print(f"      Encontrados {len(commit_hashes)} commit(s)")
-                            commits_processed, files_created = create_commit_files(
-                                folder_path, repo_full_name, commit_hashes, session
-                            )
-                            total_commits += commits_processed
-                            total_files += files_created
-                            print(f"      ✓ {commits_processed} commit(s) processado(s), {files_created} arquivo(s) criado(s)")
-                        else:
-                            print(f"      - Nenhum commit encontrado")
-                    else:
-                        print(f"      - Sem repositório GitHub associado")
-                    
-            except Exception as e:
-                errors.append((cve, str(e)))
-                print(f"   [{idx}/{len(cves)}] ✗ ERRO ao criar pasta para {cve}: {e}")
+                files_downloaded += 1
+                print(f"         ✓ {filename}")
+            else:
+                print(f"         ⚠ {filename} (não foi possível baixar)")
+            
+            time.sleep(0.1)  # Pausa entre arquivos
         
-        # Resumo final
-        print("\n" + "="*60)
-        print("=== RESUMO DA CRIAÇÃO DE PASTAS E ARQUIVOS ===")
-        print("="*60)
-        print(f"   Total de CVEs processados: {len(cves)}")
-        print(f"   Pastas criadas: {created_folders}")
-        print(f"   Pastas já existentes: {existing_folders}")
-        
-        if download_files:
-            print(f"   Total de commits processados: {total_commits}")
-            print(f"   Total de arquivos baixados: {total_files}")
-        
-        print(f"   Erros: {len(errors)}")
-        
-        if errors:
-            print("\n--- Erros Encontrados ---")
-            for cve, error in errors:
-                print(f"   • {cve}: {error}")
-        
-        print("\n[SUCESSO] Processo concluído!")
-        print(f"   As pastas foram criadas em: {os.path.abspath(base_folder)}")
+        return files_downloaded
         
     except Exception as e:
-        print(f"\n[ERRO FATAL] Erro ao processar o arquivo: {e}")
+        print(f"         ✗ Erro ao processar commit: {e}")
+        return 0
 
 
-def create_readme_for_cve(df, cve, folder_path):
+def create_cve_folders_from_excel(excel_file="5_analise_completa_tokens.xlsx", base_folder="CVEs"):
     """
-    Cria um arquivo README.md com informações sobre o CVE dentro da pasta
+    Lê o arquivo Excel e cria uma pasta para cada CVE
+    Baixa os arquivos COMPLETOS (sem sinais de diff) de cada commit
+    """
     
-    Args:
-        df: DataFrame com os dados do Excel
-        cve: Identificador do CVE
-        folder_path: Caminho da pasta onde o README será criado
-    """
+    if not os.path.exists(excel_file):
+        print(f"[ERRO] Arquivo '{excel_file}' não encontrado!")
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"  CRIADOR DE PASTAS E DOWNLOAD DE ARQUIVOS DOS CVEs")
+    print(f"  (Arquivos completos APÓS os commits - sem + e -)")
+    print(f"{'='*70}\n")
+    print(f"Analisando arquivo: {excel_file}\n")
+    
     try:
-        # Filtrar dados do CVE específico
-        cve_data = df[df['CVE'] == cve].iloc[0]
+        df = pd.read_excel(excel_file)
+        print(f"✓ Arquivo carregado com sucesso!")
+        print(f"  • Total de linhas: {len(df)}")
+        print(f"  • Colunas: {list(df.columns)}\n")
         
-        readme_path = os.path.join(folder_path, "README.md")
+        if 'CVE' not in df.columns or 'Repositório GitHub' not in df.columns:
+            print("[ERRO] Colunas necessárias não encontradas!")
+            return
+        
+        # Criar pasta base
+        os.makedirs(base_folder, exist_ok=True)
+        print(f"✓ Pasta base '{base_folder}' pronta\n")
+        
+        session = requests.Session()
+        
+        total_cves = len(df)
+        total_folders_created = 0
+        total_files_downloaded = 0
+        
+        print(f"{'='*70}")
+        print(f"  PROCESSANDO {total_cves} CVE(s)")
+        print(f"{'='*70}\n")
+        
+        for idx, row in df.iterrows():
+            cve = row.get('CVE', 'N/A')
+            repo = row.get('Repositório GitHub', 'N/A')
+            
+            if pd.isna(cve) or cve == 'N/A':
+                continue
+            
+            print(f"[{idx + 1}/{total_cves}] Processando {cve}...")
+            
+            # Criar pasta do CVE
+            folder_name = sanitize_folder_name(str(cve))
+            cve_folder = os.path.join(base_folder, folder_name)
+            
+            if not os.path.exists(cve_folder):
+                os.makedirs(cve_folder)
+                total_folders_created += 1
+            
+            # Criar README com informações do CVE
+            create_readme_for_cve(row, cve_folder)
+            
+            # Se tiver repositório, baixar arquivos dos commits
+            if pd.notna(repo) and repo != 'N/A':
+                print(f"   📦 Repositório: {repo}")
+                
+                # Buscar commits relacionados
+                commit_hashes = get_commit_hashes_from_vulnerability(cve, session)
+                
+                if commit_hashes:
+                    print(f"   🔍 {len(commit_hashes)} commit(s) encontrado(s)")
+                    
+                    for c_idx, commit_hash in enumerate(commit_hashes, 1):
+                        print(f"      [{c_idx}/{len(commit_hashes)}] Commit {commit_hash[:8]}...")
+                        
+                        # Criar pasta com o hash completo do commit
+                        commit_folder = os.path.join(cve_folder, commit_hash)
+                        os.makedirs(commit_folder, exist_ok=True)
+                        
+                        files_count = process_commit_files(
+                            repo, commit_hash, commit_folder, session
+                        )
+                        
+                        if files_count > 0:
+                            total_files_downloaded += files_count
+                            print(f"         ✓ {files_count} arquivo(s) baixado(s)")
+                        
+                        time.sleep(0.3)  # Pausa entre commits
+                else:
+                    print(f"   ℹ Nenhum commit encontrado")
+            else:
+                print(f"   ℹ Sem repositório associado")
+            
+            print()
+            time.sleep(0.2)
+        
+        # Resumo final
+        print(f"\n{'='*70}")
+        print(f"  RESUMO FINAL")
+        print(f"{'='*70}")
+        print(f"  • CVEs processados: {total_cves}")
+        print(f"  • Pastas criadas: {total_folders_created}")
+        print(f"  • Arquivos baixados: {total_files_downloaded}")
+        print(f"  • Localização: {os.path.abspath(base_folder)}")
+        print(f"{'='*70}\n")
+        print("[SUCESSO] Processo concluído!")
+        print("\nNOTA: Os arquivos foram baixados na versão APÓS o commit.")
+        print("      Não contêm os sinais + e - do diff, são arquivos completos.")
+        
+    except Exception as e:
+        print(f"\n[ERRO FATAL] {e}")
+
+
+def create_readme_for_cve(row, cve_folder):
+    """Cria um arquivo README.md com informações sobre o CVE"""
+    try:
+        readme_path = os.path.join(cve_folder, "README.md")
         
         with open(readme_path, 'w', encoding='utf-8') as f:
+            cve = row.get('CVE', 'N/A')
             f.write(f"# {cve}\n\n")
-            f.write(f"## Informações Gerais\n\n")
+            f.write(f"## 📋 Informações Gerais\n\n")
             
-            # Escrever todas as informações disponíveis
-            for column in df.columns:
-                if column != 'CVE':
-                    value = cve_data.get(column, 'N/A')
-                    f.write(f"**{column}:** {value}\n\n")
+            info_fields = {
+                'Projeto': row.get('Projeto', 'N/A'),
+                'Repositório GitHub': row.get('Repositório GitHub', 'N/A'),
+                'Caracteres Totais (Documentação)': row.get('Caracteres Totais (Documentação)', 0),
+                'Tokens Documentação': row.get('Tokens Documentação', 0),
+                'Tokens GitHub (Diff)': row.get('Tokens GitHub (Diff)', 0),
+                'Total de Tokens': row.get('Total de Tokens', 0),
+                'Linhas Adicionadas (GitHub)': row.get('Linhas Adicionadas (GitHub)', 0),
+                'Linhas Deletadas (GitHub)': row.get('Linhas Deletadas (GitHub)', 0),
+                'Total de Linhas Modificadas': row.get('Total de Linhas Modificadas', 0),
+                'Arquivos Modificados (GitHub)': row.get('Arquivos Modificados (GitHub)', 0),
+                'Tamanho Total dos Arquivos (bytes)': row.get('Tamanho Total dos Arquivos (bytes)', 0)
+            }
+            
+            for key, value in info_fields.items():
+                f.write(f"**{key}:** {value}\n\n")
+            
+            f.write(f"\n## 📁 Estrutura de Arquivos\n\n")
+            f.write(f"Esta pasta contém:\n\n")
+            f.write(f"- `README.md`: Este arquivo com informações do CVE\n")
+            f.write(f"- `[hash do commit]/`: Pastas com o hash completo de cada commit relacionado\n\n")
+            f.write(f"### Conteúdo das pastas de commit:\n\n")
+            f.write(f"- **Arquivos modificados**: Versão COMPLETA após o commit (sem sinais + e -)\n")
+            f.write(f"- `.DELETED`: Marcador para arquivos que foram deletados\n")
             
             f.write(f"\n---\n\n")
             f.write(f"*Dados extraídos de: 5_analise_completa_tokens.xlsx*\n")
+            f.write(f"*Os arquivos representam o estado APÓS cada commit*\n")
             
     except Exception as e:
-        # Se houver erro, não impede a criação da pasta
         pass
 
 
-def main():
-    """Função principal"""
-    print("="*60)
-    print("  CRIADOR DE PASTAS PARA CVEs")
-    print("  Baseado no arquivo: 5_analise_completa_tokens.xlsx")
-    print("="*60)
-    
-    # Verificar se estamos no diretório correto
-    current_dir = os.getcwd()
-    print(f"\nDiretório atual: {current_dir}")
-    
-    # Criar as pastas
-    create_cve_folders_from_excel()
-    
-    print("\n" + "="*60)
-
-
 if __name__ == "__main__":
-    main()
+    create_cve_folders_from_excel()
