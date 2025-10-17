@@ -9,6 +9,12 @@ GITHUB_TOKEN = ""
 GITHUB_API_BASE = "https://api.github.com"
 BASE_URL = "https://vulnerabilityhistory.org/api"
 
+try:
+    with open("config.json", "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+        GITHUB_TOKEN = config.get("token_github", "")
+except:
+    pass 
 
 def get_github_headers():
     """Retorna headers para requisições ao GitHub"""
